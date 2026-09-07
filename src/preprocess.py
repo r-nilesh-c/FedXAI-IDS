@@ -1,118 +1,106 @@
 import os
-import glob
-import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
 
-DATA_DIR = "data"
-OUTPUT_FILE = "data/ciciot2023_curated_subset.csv"
+DEFAULT_CSV = "data/ciciot2023_bcoa_selected.csv"
+FALLBACK_CSV = "data/ciciot2023_curated_subset.csv"
 
-# Configuration: (High-Level Category, Target Sample Quota)
-# Setting sample quota to None retains 100% of the available rows.
-FILE_CONFIG = {
-    # Benign Baseline (~28% of total dataset)
-    'BenignTraffic': ('Benign', 100000),
-    
-    # Web & Stealth Malware (Keep 100% of available rows)
-    'Backdoor_Malware': ('Web_Malware', None),
-    'BrowserHijacking': ('Web_Malware', None),
-    'CommandInjection': ('Web_Malware', None),
-    'SqlInjection': ('Web_Malware', None),
-    'Uploading_Attack': ('Web_Malware', None),
-    'XSS': ('Web_Malware', None),
-    'DictionaryBruteForce': ('BruteForce', None),
-    
-    # Reconnaissance (~40,000 total)
-    'Recon-PingSweep': ('Recon', None),
-    'Recon-HostDiscovery': ('Recon', 9500),
-    'Recon-OSScan': ('Recon', 9500),
-    'Recon-PortScan': ('Recon', 9500),
-    'VulnerabilityScan': ('Recon', 9500),
-    
-    # Spoofing (~40,000 total)
-    'DNS_Spoofing': ('Spoofing', 20000),
-    'MITM-ArpSpoofing': ('Spoofing', 20000),
-    
-    # DoS (~60,000 total)
-    'DoS-HTTP_Flood': ('DoS', 15000),
-    'DoS-SYN_Flood': ('DoS', 15000),
-    'DoS-TCP_Flood': ('DoS', 15000),
-    'DoS-UDP_Flood': ('DoS', 15000),
-    
-    # DDoS & Mirai Botnet (~82,500 total across 15 sub-types)
-    'DDoS-ACK_Fragmentation': ('DDoS', 5500),
-    'DDoS-HTTP_Flood-': ('DDoS', 5500),
-    'DDoS-ICMP_Flood': ('DDoS', 5500),
-    'DDoS-ICMP_Fragmentation': ('DDoS', 5500),
-    'DDoS-PSHACK_Flood': ('DDoS', 5500),
-    'DDoS-RSTFINFlood': ('DDoS', 5500),
-    'DDoS-SlowLoris': ('DDoS', 5500),
-    'DDoS-SynonymousIP_Flood': ('DDoS', 5500),
-    'DDoS-SYN_Flood': ('DDoS', 5500),
-    'DDoS-TCP_Flood': ('DDoS', 5500),
-    'DDoS-UDP_Flood': ('DDoS', 5500),
-    'DDoS-UDP_Fragmentation': ('DDoS', 5500),
-    'Mirai-greeth_flood': ('DDoS', 5500),
-    'Mirai-greip_flood': ('DDoS', 5500),
-    'Mirai-udpplain': ('DDoS', 5500)
-}
-
-def preprocess_dataset(data_dir: str = DATA_DIR, output_file: str = OUTPUT_FILE):
+def load_and_partition_data(csv_path: str = None,
+                            num_clients: int = 3,
+                            alpha: float = 0.5,
+                            batch_size: int = 128,
+                            seed: int = 42):
     """
-    Curates raw CICIoT2023 CSV files by mapping granular sub-folder attack types
-    into 7 high-level parent categories, sampling rows according to configured quotas,
-    sanitizing invalid numerical values, and encoding target labels.
+    Loads the curated/BCOA dataset, applies per-training preprocessing, 
+    and partitions samples across edge clients using Dirichlet Dir(alpha) 
+    for Non-IID label skew.
+    
+    Returns:
+        client_dataloaders: Dict containing Train, Val, Test DataLoaders per client
+        global_class_priors: Prior probabilities vector pi for Logit Adjustment Loss
+        feature_cols: List of active feature names
     """
-    processed_dfs = []
-    print("Starting CICIoT2023 file aggregation and sub-class mapping...")
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     
-    for file_key, (high_level_class, sample_quota) in FILE_CONFIG.items():
-        matching_files = glob.glob(os.path.join(data_dir, f"*{file_key}*.csv"))
-        if not matching_files:
-            print(f"[WARNING] Skipping missing raw file key: {file_key}")
-            continue
+    # Resolve CSV file path
+    if csv_path is None:
+        if os.path.exists(DEFAULT_CSV):
+            csv_path = DEFAULT_CSV
+        elif os.path.exists(FALLBACK_CSV):
+            csv_path = FALLBACK_CSV
+        else:
+            raise FileNotFoundError(f"Neither {DEFAULT_CSV} nor {FALLBACK_CSV} found.")
             
-        filepath = matching_files[0]
-        df = pd.read_csv(filepath)
+    print(f"\n[PREPROCESS] Loading dataset from: {csv_path}")
+    df = pd.read_csv(csv_path)
+    
+    drop_cols = ['parent_label', 'label_encoded']
+    feature_cols = [c for c in df.columns if c not in drop_cols]
+    
+    X = df[feature_cols].values.astype(np.float32)
+    y = df['label_encoded'].values.astype(np.int64)
+    
+    num_classes = len(np.unique(y))
+    num_samples = len(y)
+    feature_dim = X.shape[1]
+    
+    print(f"[PREPROCESS] Total Samples: {num_samples:,} | Feature Dim: {feature_dim} | Num Classes: {num_classes}")
+    
+    # Non-IID Dirichlet Partitioning across classes
+    class_indices = [np.where(y == c)[0] for c in range(num_classes)]
+    client_indices = [[] for _ in range(num_clients)]
+    
+    for c in range(num_classes):
+        idx = class_indices[c]
+        np.random.shuffle(idx)
         
-        # Sub-sample dataset if quota is specified
-        if sample_quota is not None and len(df) > sample_quota:
-            df = df.sample(n=sample_quota, random_state=42)
+        # Sample proportions from Dirichlet distribution Dir(alpha)
+        proportions = np.random.dirichlet([alpha] * num_clients)
+        split_points = (np.cumsum(proportions) * len(idx)).astype(int)[:-1]
+        splits = np.split(idx, split_points)
+        
+        for client_id, split in enumerate(splits):
+            client_indices[client_id].extend(split)
             
-        # Map sub-folder attack to parent category
-        df['parent_label'] = high_level_class
+    client_dataloaders = {}
+
+    
+    # Global class prior frequencies (pi)
+    class_counts = np.bincount(y, minlength=num_classes)
+    global_class_priors = class_counts / num_samples
+    
+    print("\n[PREPROCESS] Client Non-IID Label Distribution Summary:")
+    for client_id in range(num_clients):
+        c_idx = np.array(client_indices[client_id])
+        np.random.shuffle(c_idx)
         
-        # Remove raw sub-class label column to prevent duplicated target columns
-        if 'label' in df.columns:
-            df = df.drop(columns=['label'])
-            
-        processed_dfs.append(df)
-        print(f"Loaded {len(df):>7} rows from {os.path.basename(filepath)} -> Class: {high_level_class}")
+        # Train (80%) / Val (10%) / Test (10%) splits
+        X_c, y_c = X[c_idx], y[c_idx]
+        X_tr, X_temp, y_tr, y_temp = train_test_split(X_c, y_c, test_size=0.20, random_state=seed, stratify=y_c)
+        X_va, X_te, y_va, y_te = train_test_split(X_temp, y_temp, test_size=0.50, random_state=seed, stratify=y_temp)
         
-    if not processed_dfs:
-        raise FileNotFoundError(f"No matching CSV files found in directory: {data_dir}")
+        # Client-specific class priors for Logit Adjustment
+        c_class_counts = np.bincount(y_tr, minlength=num_classes)
+        c_class_priors = (c_class_counts + 1e-5) / np.sum(c_class_counts + 1e-5)
         
-    # Combine into master dataframe
-    master_df = pd.concat(processed_dfs, ignore_index=True)
-    
-    # Clean non-finite floating point numbers and missing values
-    print("Sanitizing infinite values and dropping nulls...")
-    master_df = master_df.replace([np.inf, -np.inf], np.nan).dropna()
-    
-    # Encode parent labels into numerical targets (0 to 6)
-    label_encoder = LabelEncoder()
-    master_df['label_encoded'] = label_encoder.fit_transform(master_df['parent_label'])
-    
-    # Build class mapping reference dict
-    class_mapping = dict(zip(label_encoder.classes_, label_encoder.transform(label_encoder.classes_)))
-    print(f"Label Encoding Map: {class_mapping}")
-    
-    # Save curated output CSV
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    master_df.to_csv(output_file, index=False)
-    print(f"[SUCCESS] Curated dataset saved to {output_file} | Shape: {master_df.shape}")
-    
-    return master_df, class_mapping
+        client_dataloaders[client_id] = {
+            "train": DataLoader(TensorDataset(torch.tensor(X_tr), torch.tensor(y_tr)), batch_size=batch_size, shuffle=True),
+            "val": DataLoader(TensorDataset(torch.tensor(X_va), torch.tensor(y_va)), batch_size=batch_size, shuffle=False),
+            "test": DataLoader(TensorDataset(torch.tensor(X_te), torch.tensor(y_te)), batch_size=batch_size, shuffle=False),
+            "feature_dim": feature_dim,
+            "num_classes": num_classes,
+            "feature_names": feature_cols,
+            "class_priors": c_class_priors,
+            "sample_counts": {"train": len(y_tr), "val": len(y_va), "test": len(y_te)}
+        }
+        
+        print(f"  Client {client_id+1}: Train={len(y_tr):>6} | Val={len(y_va):>5} | Test={len(y_te):>5}")
+        
+    return client_dataloaders, global_class_priors, feature_cols
 
 if __name__ == "__main__":
-    preprocess_dataset()
+    load_and_partition_data()
